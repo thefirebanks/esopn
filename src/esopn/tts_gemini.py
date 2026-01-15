@@ -13,14 +13,16 @@ logger = logging.getLogger(__name__)
 # Default voice configurations for the two commentators
 # See: https://ai.google.dev/gemini-api/docs/speech-generation
 DEFAULT_VOICES = {
-    "alex": "Kore",      # Bold, confident - lead play-by-play energy
-    "morgan": "Charon",  # Deep, authoritative - color commentary veteran
+    "alex": "Orus",      # Male - bold, energetic lead play-by-play
+    "morgan": "Fenrir",  # Male - deep, authoritative color commentary veteran
 }
 
-# Alternative voice options:
-# Bold/Confident: Kore, Fenrir, Orus
-# Deep/Authoritative: Charon, Orus, Fenrir
-# Energetic: Puck, Fenrir, Laomedeia
+# Male voice options: Achird, Algenib, Algieba, Alnilam, Charon, Enceladus, 
+#                     Fenrir, Iapetus, Orus, Puck, Rasalgethi, Sadachbia,
+#                     Sadaltager, Schedar, Umbriel, Zubenelgenubi
+# Female voice options: Kore, Aoede, Achernar, Autonoe, Callirrhoe, Despina,
+#                       Erinome, Gacrux, Laomedeia, Leda, Pulcherrima, 
+#                       Sulafat, Vindemiatrix, Zephyr
 
 
 @dataclass
