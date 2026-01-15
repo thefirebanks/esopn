@@ -13,14 +13,14 @@ logger = logging.getLogger(__name__)
 # Default voice configurations for the two commentators
 # See: https://ai.google.dev/gemini-api/docs/speech-generation
 DEFAULT_VOICES = {
-    "alex": "Puck",      # Energetic, higher pitch - play-by-play excitement
-    "morgan": "Charon",  # Deeper, calmer - analytical color commentary
+    "alex": "Kore",      # Bold, confident - lead play-by-play energy
+    "morgan": "Charon",  # Deep, authoritative - color commentary veteran
 }
 
 # Alternative voice options:
-# Excitable/Energetic: Fenrir, Puck, Laomedeia, Sadachbia
-# Calm/Analytical: Kore, Charon, Gacrux, Aoede, Schedar
-# Warm/Friendly: Sulafat, Achird, Aoede
+# Bold/Confident: Kore, Fenrir, Orus
+# Deep/Authoritative: Charon, Orus, Fenrir
+# Energetic: Puck, Fenrir, Laomedeia
 
 
 @dataclass
