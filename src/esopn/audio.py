@@ -8,6 +8,8 @@ from typing import Optional
 
 import numpy as np
 
+from .audio_utils import resample_audio
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +48,9 @@ class AudioPlayer:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._chunk_counter = 0
+        self._chunk_counter_lock = threading.Lock()
+        self._currently_playing = threading.Event()
+        self._playback_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the audio playback thread."""
@@ -66,8 +71,13 @@ class AudioPlayer:
         self._stop_event.set()
         self._playing = False
 
+        import sounddevice as sd
+
+        with self._playback_lock:
+            sd.stop()
+
         # Clear the queue
-        while not self._queue.empty():
+        while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
@@ -97,9 +107,11 @@ class AudioPlayer:
         # Priority queue: lower number = higher priority
         # Use negative priority so higher priority values play first
         # Add counter to maintain FIFO order for same priority
-        self._chunk_counter += 1
+        with self._chunk_counter_lock:
+            self._chunk_counter += 1
+            counter = self._chunk_counter
         try:
-            self._queue.put((-priority, self._chunk_counter, chunk), block=False)
+            self._queue.put((-priority, counter, chunk), block=False)
         except queue.Full:
             logger.warning("Audio queue full, dropping chunk")
 
@@ -121,8 +133,13 @@ class AudioPlayer:
         elif audio.ndim == 1 and self.channels == 2:
             audio = np.column_stack([audio, audio])
 
-        sd.play(audio, sr)
-        sd.wait()
+        with self._playback_lock:
+            self._currently_playing.set()
+            try:
+                sd.play(audio, sr)
+                sd.wait()
+            finally:
+                self._currently_playing.clear()
 
     def _playback_loop(self) -> None:
         """Background thread for audio playback."""
@@ -145,8 +162,13 @@ class AudioPlayer:
                     audio = np.column_stack([audio, audio])
 
                 # Play audio
-                sd.play(audio, self.sample_rate)
-                sd.wait()
+                with self._playback_lock:
+                    self._currently_playing.set()
+                    try:
+                        sd.play(audio, self.sample_rate)
+                        sd.wait()
+                    finally:
+                        self._currently_playing.clear()
 
             except queue.Empty:
                 continue
@@ -155,26 +177,16 @@ class AudioPlayer:
 
     def _resample(self, audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
         """Simple resampling using linear interpolation."""
-        if src_rate == dst_rate:
-            return audio
-
-        duration = len(audio) / src_rate
-        new_length = int(duration * dst_rate)
-
-        # Linear interpolation
-        old_indices = np.linspace(0, len(audio) - 1, new_length)
-        new_audio = np.interp(old_indices, np.arange(len(audio)), audio)
-
-        return new_audio.astype(audio.dtype)
+        return resample_audio(audio, src_rate, dst_rate)
 
     @property
     def is_playing(self) -> bool:
         """Check if audio is currently being played."""
-        return self._playing and not self._queue.empty()
+        return self._playing and (not self._queue.empty() or self._currently_playing.is_set())
 
     def wait(self) -> None:
         """Wait for all queued audio to finish playing."""
-        while not self._queue.empty():
+        while not self._queue.empty() or self._currently_playing.is_set():
             import time
 
             time.sleep(0.1)
@@ -188,7 +200,7 @@ class AudioManager:
         self.player = AudioPlayer(sample_rate=sample_rate)
         self.sample_rate = sample_rate
         self._started = False
-        
+
         # Ambient sound support
         self._ambient_thread: Optional[threading.Thread] = None
         self._ambient_stop_event = threading.Event()
@@ -208,72 +220,68 @@ class AudioManager:
     def set_ambient(self, audio: np.ndarray, volume: float = 0.12) -> None:
         """
         Set the ambient background audio to loop.
-        
+
         Args:
             audio: Ambient audio samples (will be looped)
             volume: Ambient volume (0.0 to 1.0)
         """
         self._ambient_audio = audio * volume
         self._ambient_volume = volume
-    
+
     def start_ambient(self) -> None:
         """Start playing ambient audio in a loop."""
         if self._ambient_audio is None:
             logger.warning("No ambient audio set")
             return
-        
+
         if self._ambient_playing:
             return
-        
+
         self._ambient_stop_event.clear()
         self._ambient_playing = True
         self._ambient_thread = threading.Thread(target=self._ambient_loop, daemon=True)
         self._ambient_thread.start()
         logger.info("Ambient audio started")
-    
+
     def stop_ambient(self) -> None:
         """Stop the ambient audio loop."""
         if not self._ambient_playing:
             return
-        
+
         self._ambient_stop_event.set()
         self._ambient_playing = False
-        
+
         if self._ambient_thread:
             self._ambient_thread.join(timeout=2.0)
             self._ambient_thread = None
-        
+
         logger.info("Ambient audio stopped")
-    
+
     def _ambient_loop(self) -> None:
         """Background thread for looping ambient audio."""
-        import sounddevice as sd
-        
         if self._ambient_audio is None:
             return
-        
+
         while not self._ambient_stop_event.is_set():
             try:
                 # Wait if paused (during commentary playback)
                 if self._ambient_pause_event.is_set():
                     import time
+
                     time.sleep(0.1)
                     continue
-                
-                # Play the ambient loop
-                sd.play(self._ambient_audio, self.sample_rate)
-                
-                # Wait for playback to complete or stop/pause signal
+
                 duration = len(self._ambient_audio) / self.sample_rate
-                wait_time = 0
-                while wait_time < duration:
+                self.player.play(self._ambient_audio, self.sample_rate, priority=-10)
+
+                import time
+
+                end_time = time.time() + duration
+                while time.time() < end_time:
                     if self._ambient_stop_event.is_set() or self._ambient_pause_event.is_set():
-                        sd.stop()
                         break
-                    import time
                     time.sleep(0.1)
-                    wait_time += 0.1
-                    
+
             except Exception as e:
                 logger.error(f"Ambient playback error: {e}")
                 break
@@ -287,26 +295,21 @@ class AudioManager:
 
     def play_commentary_sync(self, audio: np.ndarray, sample_rate: int) -> None:
         """Play commentary audio synchronously (pauses ambient during playback)."""
-        import sounddevice as sd
-        
         # Pause ambient while commentary plays
         self._ambient_pause_event.set()
-        sd.stop()  # Stop any current playback immediately
-        
-        import time
-        time.sleep(0.05)  # Brief pause to let audio device settle
-        
+        self.player.stop()
+
         # Play commentary
         self.player.play_sync(audio, sample_rate)
-        
+
+        self.player.start()
+
         # Resume ambient
         self._ambient_pause_event.clear()
 
     def stop_all(self) -> None:
         """Stop all audio playback immediately (for pause functionality)."""
-        import sounddevice as sd
-        sd.stop()
-        # Pause ambient too
+        self.player.stop()
         self._ambient_pause_event.set()
 
     def shutdown(self) -> None:

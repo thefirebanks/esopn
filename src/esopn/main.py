@@ -2,16 +2,19 @@
 
 import logging
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from queue import Empty
+from typing import Literal, Optional
 
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
 
 from . import __version__
+from .personas import CommentaryMode
 
 app = typer.Typer(
     name="esopn",
@@ -22,7 +25,7 @@ console = Console()
 
 
 def _run_commentary_process(
-    settings,
+    settings_overrides: dict,
     command_queue,
     ui_focused_queue,
     enable_hotkey: bool,
@@ -30,13 +33,14 @@ def _run_commentary_process(
     """Run commentary in a separate process. Must be module-level for pickling."""
     import sys
     import traceback
-    
+
     try:
         # Re-setup logging for the subprocess
         import logging
+
         from rich.console import Console
         from rich.logging import RichHandler
-        
+
         console = Console()
         logging.basicConfig(
             level=logging.INFO,
@@ -45,8 +49,16 @@ def _run_commentary_process(
             handlers=[RichHandler(console=console, rich_tracebacks=True)],
             force=True,  # Force reconfiguration in subprocess
         )
-        
+
+        from .config import get_cached_settings
         from .orchestrator import run_commentary
+
+        settings = get_cached_settings()
+        settings.capture_interval = settings_overrides["capture_interval"]
+        settings.capture_monitor = settings_overrides["capture_monitor"]
+        settings.commentary_mode = settings_overrides["commentary_mode"]
+        settings.tts_device = settings_overrides["tts_device"]
+        settings.gemini_api_key = _resolve_gemini_api_key(settings)
 
         run_commentary(
             settings,
@@ -73,6 +85,32 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def _resolve_gemini_api_key(settings) -> str:
+    """Resolve Gemini API key from settings and env with compatibility fallback."""
+    key = settings.gemini_api_key
+    if not key:
+        key = os.environ.get("GEMINI_API_KEY", "")
+    return key
+
+
+def _apply_common_overrides(settings, interval: float, device: str, mode: CommentaryMode) -> None:
+    """Apply shared run/watch CLI overrides."""
+    settings.capture_interval = interval
+    settings.commentary_mode = mode
+    if device != "auto":
+        settings.tts_device = device
+
+
+def _validate_output_path(output: Path) -> Path:
+    """Ensure output path stays within the current working directory."""
+    resolved = output.expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    if os.path.commonpath([str(cwd), str(resolved)]) != str(cwd):
+        raise ValueError(f"Output path must be inside the current directory: {cwd}")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
 @app.command()
 def run(
     interval: float = typer.Option(
@@ -93,18 +131,17 @@ def run(
         "-w",
         help="Capture only the active/focused window",
     ),
-    gemini_key: Optional[str] = typer.Option(
-        None,
-        "--gemini-key",
-        "-k",
-        envvar="GEMINI_API_KEY",
-        help="Google Gemini API key",
-    ),
     device: str = typer.Option(
         "auto",
         "--device",
         "-d",
         help="Device for TTS inference: cuda, mps, cpu, or auto",
+    ),
+    mode: CommentaryMode = typer.Option(
+        "sports",
+        "--mode",
+        "-M",
+        help="Commentary mode",
     ),
     hotkey: str = typer.Option(
         "<ctrl>+<shift>+p",
@@ -130,32 +167,31 @@ def run(
     sports-style commentary on AI coding activity.
 
     Examples:
-        esopn run                           # Full screen capture
+        esopn run                           # Full screen capture (sports mode)
         esopn run --active-window           # Capture focused window only
         esopn run -w -i 3                   # Active window, 3s interval
+        esopn run --mode wwe                # WWE wrestling style commentary
+        esopn run --mode freeman_mj         # Morgan Freeman + Michael Jackson
     """
     setup_logging(verbose)
 
     # Import here to avoid slow startup for --help
-    from .config import get_settings
+    from .config import get_cached_settings
     from .orchestrator import run_commentary
 
     # Load settings from .env and environment
-    settings = get_settings()
-    
+    settings = get_cached_settings()
+
     # Override with CLI options
-    settings.capture_interval = interval
+    _apply_common_overrides(settings, interval=interval, device=device, mode=mode)
     settings.capture_monitor = monitor
-    if gemini_key:
-        settings.gemini_api_key = gemini_key
-    if device != "auto":
-        settings.tts_device = device
+    settings.gemini_api_key = _resolve_gemini_api_key(settings)
 
     # Validate Gemini API key
     if not settings.gemini_api_key:
         console.print(
             "[red]Error: Gemini API key required.[/red]\n"
-            "Set GEMINI_API_KEY environment variable or use --gemini-key option."
+            "Set ESOPN_GEMINI_API_KEY in your environment or .env file."
         )
         raise typer.Exit(1)
 
@@ -187,18 +223,17 @@ def watch(
         "-i",
         help="Seconds between screenshots",
     ),
-    gemini_key: Optional[str] = typer.Option(
-        None,
-        "--gemini-key",
-        "-k",
-        envvar="GEMINI_API_KEY",
-        help="Google Gemini API key",
-    ),
     device: str = typer.Option(
         "auto",
         "--device",
         "-d",
         help="Device for TTS inference: cuda, mps, cpu, or auto",
+    ),
+    mode: CommentaryMode = typer.Option(
+        "sports",
+        "--mode",
+        "-M",
+        help="Commentary mode",
     ),
     ui: bool = typer.Option(
         False,
@@ -223,6 +258,8 @@ def watch(
         esopn watch opencode           # Start opencode with commentary
         esopn watch "vim main.py"      # Watch vim session
         esopn watch opencode --ui      # With floating controller window
+        esopn watch --ui --mode wwe    # WWE wrestling style!
+        esopn watch --mode freeman_mj  # Morgan Freeman + Michael Jackson
     """
     setup_logging(verbose)
 
@@ -230,57 +267,68 @@ def watch(
     import signal
     import time
 
-    from .config import get_settings
-    from .orchestrator import Orchestrator
+    from .config import get_cached_settings
 
     # Load settings from .env and environment
-    settings = get_settings()
-    
+    settings = get_cached_settings()
+
     # Override with CLI options
-    settings.capture_interval = interval
+    _apply_common_overrides(settings, interval=interval, device=device, mode=mode)
     settings.capture_monitor = 1
-    if gemini_key:
-        settings.gemini_api_key = gemini_key
-    if device != "auto":
-        settings.tts_device = device
+    settings.gemini_api_key = _resolve_gemini_api_key(settings)
 
     # Validate Gemini API key
     if not settings.gemini_api_key:
         console.print(
             "[red]Error: Gemini API key required.[/red]\n"
-            "Set GEMINI_API_KEY environment variable or use --gemini-key option."
+            "Set ESOPN_GEMINI_API_KEY in your environment or .env file."
         )
         raise typer.Exit(1)
 
     # Set up command bus queues if UI is enabled
     command_queue = None
     ui_focused_queue = None
+    watch_control_queue = None
     ui_process = None
 
     if ui:
         from multiprocessing import Queue
+
         from .ui import run_controller_window
 
         command_queue = Queue()
         ui_focused_queue = Queue()
+        watch_control_queue = Queue()
 
         # Start UI controller in a separate process
         ui_process = multiprocessing.Process(
             target=run_controller_window,
-            args=(command_queue, ui_focused_queue),
+            args=(command_queue, ui_focused_queue, watch_control_queue),
             daemon=True,
         )
 
     # Start commentary in background process
     commentary_process = multiprocessing.Process(
         target=_run_commentary_process,
-        args=(settings, command_queue, ui_focused_queue, not ui),
+        args=(
+            {
+                "capture_interval": settings.capture_interval,
+                "capture_monitor": settings.capture_monitor,
+                "commentary_mode": settings.commentary_mode,
+                "tts_device": settings.tts_device,
+            },
+            command_queue,
+            ui_focused_queue,
+            not ui,
+        ),
         daemon=True,
     )
 
     console.print("[bold green]🎙️ ESOPN Watch Mode[/bold green]")
     if ui:
-        console.print("[dim]UI controller enabled. Use the floating window to control commentary.[/dim]")
+        console.print(
+            "[dim]UI controller enabled. Use the floating window to control commentary.[/dim]"
+        )
     console.print(f"[dim]Starting commentary (active window, every {interval}s)...[/dim]\n")
 
     # Start processes
@@ -306,7 +354,9 @@ def watch(
                     watched_process.wait(timeout=3)
                     console.print("[green]Watched process exited gracefully.[/green]")
                 except subprocess.TimeoutExpired:
-                    console.print("[yellow]Timeout waiting for graceful shutdown, forcing termination...[/yellow]")
+                    console.print(
+                        "[yellow]Timeout waiting for graceful shutdown, forcing termination...[/yellow]"
+                    )
                     watched_process.terminate()
                     try:
                         watched_process.wait(timeout=2)
@@ -332,21 +382,19 @@ def watch(
             ui_process.terminate()
             ui_process.join(timeout=1)
 
-    def check_stop_watch_command():
+    def check_stop_watch_command() -> bool:
         """Check if a STOP_WATCH command was received."""
-        if command_queue is None:
+        if watch_control_queue is None:
             return False
-        try:
-            # Peek at the queue without consuming (we'll put it back)
-            from .control import Command
-            while not command_queue.empty():
-                cmd = command_queue.get_nowait()
-                if cmd == Command.STOP_WATCH:
-                    return True
-                # Put non-STOP_WATCH commands back
-                command_queue.put(cmd)
-        except Exception:
-            pass
+        from .control import Command
+
+        while True:
+            try:
+                cmd = watch_control_queue.get_nowait()
+            except Empty:
+                break
+            if cmd == Command.STOP_WATCH:
+                return True
         return False
 
     if command:
@@ -354,10 +402,12 @@ def watch(
         console.print(f"[bold]Running: {command}[/bold]\n")
         try:
             # Run command in foreground using Popen for more control
+            command_args = shlex.split(command)
+            if not command_args:
+                raise ValueError("Command is empty after parsing")
             watched_process = subprocess.Popen(
-                command,
-                shell=True,
-                env={**os.environ, "GEMINI_API_KEY": gemini_key},
+                command_args,
+                shell=False,
             )
 
             # Wait for either the command to finish or a stop signal
@@ -384,7 +434,9 @@ def watch(
             console.print("[dim]Commentary running. Use the controller window to stop.[/dim]\n")
         else:
             console.print("[dim]Commentary running. Press Ctrl+C to stop.[/dim]\n")
-        console.print("[dim]Open another terminal or switch windows to see commentary in action.[/dim]\n")
+        console.print(
+            "[dim]Open another terminal or switch windows to see commentary in action.[/dim]\n"
+        )
 
         try:
             # Wait for either commentary to finish or UI stop command
@@ -426,8 +478,9 @@ def test_capture(
         screenshot = capture_screenshot(monitor=monitor)
 
     try:
-        screenshot.image.save(output)
-        console.print(f"[green]Saved to {output}[/green]")
+        output_path = _validate_output_path(output)
+        screenshot.image.save(output_path)
+        console.print(f"[green]Saved to {output_path}[/green]")
         console.print(f"Size: {screenshot.width}x{screenshot.height}")
         if screenshot.window_title:
             console.print(f"Window: {screenshot.window_title}")
@@ -450,10 +503,10 @@ def test_tts(
         "-o",
         help="Output file path",
     ),
-    provider: str = typer.Option(
+    provider: Literal["auto", "gemini", "elevenlabs", "dia"] = typer.Option(
         "auto",
         "--provider",
-        help="TTS provider: elevenlabs, dia, or auto (uses config)",
+        help="TTS provider: gemini, elevenlabs, dia, or auto (uses config)",
     ),
     play: bool = typer.Option(
         False,
@@ -463,22 +516,27 @@ def test_tts(
     ),
 ) -> None:
     """Test TTS synthesis."""
-    from .config import get_settings
+    from .config import get_cached_settings
     from .tts import TTSManager
 
-    settings = get_settings()
-    
+    settings = get_cached_settings()
+
     # Determine provider
     tts_provider = settings.tts_provider if provider == "auto" else provider
-    if tts_provider not in ("elevenlabs", "dia"):
-        console.print(f"[red]Invalid provider: {tts_provider}. Use 'elevenlabs' or 'dia'.[/red]")
+    if tts_provider not in ("gemini", "elevenlabs", "dia"):
+        console.print(
+            f"[red]Invalid provider: {tts_provider}. Use 'gemini', 'elevenlabs', or 'dia'.[/red]"
+        )
         raise typer.Exit(1)
-    
+
     console.print(f"Using TTS provider: {tts_provider}")
 
     try:
         tts = TTSManager(
-            provider=tts_provider,  # type: ignore
+            provider=tts_provider,
+            gemini_api_key=_resolve_gemini_api_key(settings),
+            gemini_alex_voice=settings.gemini_alex_voice,
+            gemini_morgan_voice=settings.gemini_morgan_voice,
             elevenlabs_api_key=settings.elevenlabs_api_key,
             elevenlabs_model=settings.elevenlabs_model,
             elevenlabs_alex_voice=settings.elevenlabs_alex_voice,
@@ -493,8 +551,10 @@ def test_tts(
 
         # Save audio
         import soundfile as sf
-        sf.write(output, audio.audio, audio.sample_rate)
-        console.print(f"[green]Saved to {output}[/green]")
+
+        output_path = _validate_output_path(output)
+        sf.write(output_path, audio.audio, audio.sample_rate)
+        console.print(f"[green]Saved to {output_path}[/green]")
         console.print(f"Duration: {audio.duration:.2f}s")
 
         if play:
@@ -513,15 +573,12 @@ def test_tts(
 @app.command()
 def test_vision(
     image: Path = typer.Argument(..., help="Path to image file"),
-    gemini_key: Optional[str] = typer.Option(
-        None,
-        "--gemini-key",
-        "-k",
-        envvar="GEMINI_API_KEY",
-        help="Google Gemini API key",
-    ),
 ) -> None:
     """Test vision analysis on an image."""
+    from .config import get_cached_settings
+
+    settings = get_cached_settings()
+    gemini_key = _resolve_gemini_api_key(settings)
     if not gemini_key:
         console.print("[red]Error: Gemini API key required.[/red]")
         raise typer.Exit(1)
@@ -616,7 +673,9 @@ def info() -> None:
     if platform.system() == "Darwin":
         console.print("\n[bold]macOS Permissions:[/bold]")
         console.print("[dim]Active window capture requires accessibility permissions.[/dim]")
-        console.print("[dim]Grant access in System Preferences → Privacy & Security → Accessibility[/dim]")
+        console.print(
+            "[dim]Grant access in System Preferences → Privacy & Security → Accessibility[/dim]"
+        )
 
 
 def main() -> None:
