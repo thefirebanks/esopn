@@ -5,27 +5,27 @@ description = "AI Sports Commentator Duo - Real-time commentary for AI coding ag
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mss>=10.0.0",
-    "google-genai>=1.0.0",
-    "torch>=2.0.0",
-    "torchaudio>=2.0.0",
-    "transformers>=4.52.0",
-    "sounddevice>=0.5.0",
-    "soundfile>=0.12.0",
-    "numpy>=1.24.0",
-    "Pillow>=10.0.0",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
-    "rich>=13.0.0",
-    "typer>=0.9.0",
-    "pynput>=1.7.0",
-    "elevenlabs>=1.0.0",
+    "mss>=10.0.0,<11.0.0",
+    "google-genai>=1.0.0,<2.0.0",
+    "torch>=2.0.0,<3.0.0",
+    "torchaudio>=2.0.0,<3.0.0",
+    "transformers>=4.52.0,<5.0.0",
+    "sounddevice>=0.5.0,<1.0.0",
+    "soundfile>=0.12.0,<1.0.0",
+    "numpy>=1.24.0,<3.0.0",
+    "Pillow>=10.0.0,<12.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "pydantic-settings>=2.0.0,<3.0.0",
+    "rich>=13.0.0,<15.0.0",
+    "typer>=0.9.0,<1.0.0",
+    "pynput>=1.7.0,<2.0.0",
+    "elevenlabs>=1.0.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "ruff>=0.1.0",
+    "pytest>=7.0.0,<9.0.0",
+    "ruff>=0.1.0,<1.0.0",
 ]
 
 [project.scripts]
@@ -44,9 +44,10 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
 
 [tool.uv]
 dev-dependencies = [
-    "pytest>=7.0.0",
-    "ruff>=0.1.0",
+    "pytest>=7.0.0,<9.0.0",
+    "ruff>=0.1.0,<1.0.0",
 ]

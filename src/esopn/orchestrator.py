@@ -1,9 +1,11 @@
 """Main orchestrator that coordinates all components for real-time commentary."""
 
 import logging
+import queue
 import signal
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from multiprocessing import Queue
 from typing import Callable, Optional
@@ -18,6 +20,8 @@ from .commentary import Commentary, CommentaryGenerator, get_fallback_commentary
 from .config import Settings
 from .control import Command
 from .crowd import CrowdManager
+from .personas import get_voices
+from .sfx import SFXManager
 from .tts import SynthesizedAudio, TTSManager
 from .vision import SceneAnalysis, VisionAnalyzer
 
@@ -42,7 +46,7 @@ class CommentaryState:
     last_scene: Optional[SceneAnalysis] = None
     last_commentary: Optional[Commentary] = None
     last_screenshot: Optional[Screenshot] = None  # For change detection
-    recent_scenes: list[SceneAnalysis] = field(default_factory=list)
+    recent_scenes: deque[SceneAnalysis] = field(default_factory=lambda: deque(maxlen=5))
     paused: bool = False
 
     @property
@@ -91,6 +95,8 @@ class HotkeyListener:
         """Stop listening for hotkeys."""
         if self._listener:
             self._listener.stop()
+            if hasattr(self._listener, "join"):
+                self._listener.join(timeout=1.0)
             self._listener = None
         self._running = False
 
@@ -129,6 +135,9 @@ class Orchestrator:
         self._ui_focused_queue = ui_focused_queue
         self._ui_focused = False
 
+        # Get mode-specific voices for TTS
+        alex_voice, morgan_voice = get_voices(settings.commentary_mode)
+
         # Initialize components
         self.capture = ScreenCapture(
             monitor=settings.capture_monitor,
@@ -141,13 +150,14 @@ class Orchestrator:
         self.commentary = CommentaryGenerator(
             api_key=settings.gemini_api_key,
             model=settings.vision_model,
+            mode=settings.commentary_mode,
         )
         self.tts = TTSManager(
-            provider=settings.tts_provider,  # type: ignore
-            # Gemini settings (default - FREE!)
+            provider=settings.tts_provider,
+            # Gemini settings (default - FREE!) - use mode-specific voices
             gemini_api_key=settings.gemini_api_key,
-            gemini_alex_voice=settings.gemini_alex_voice,
-            gemini_morgan_voice=settings.gemini_morgan_voice,
+            gemini_alex_voice=alex_voice,
+            gemini_morgan_voice=morgan_voice,
             # ElevenLabs settings (fallback)
             elevenlabs_api_key=settings.elevenlabs_api_key,
             elevenlabs_model=settings.elevenlabs_model,
@@ -165,6 +175,11 @@ class Orchestrator:
             ambient_enabled=settings.crowd_ambient_enabled,
             ambient_volume=settings.crowd_ambient_volume,
         )
+        self.sfx = SFXManager(
+            sample_rate=settings.audio_sample_rate,
+            volume=settings.sfx_volume,
+            enabled=settings.sfx_enabled,
+        )
 
         # Hotkey listener
         self._hotkey_listener: Optional[HotkeyListener] = None
@@ -172,17 +187,23 @@ class Orchestrator:
         self._running = False
         self._shutdown_requested = False
         self._stop_watch_requested = False
-        self._pending_cleared = False  # Flag to clear pending commentary on pause
+        self._paused_event = threading.Event()
+        self._shutdown_event = threading.Event()
+        self._state_lock = threading.Lock()
 
     def _toggle_pause(self) -> None:
         """Toggle pause state (called by hotkey)."""
-        self.state.paused = not self.state.paused
-        if self.state.paused:
+        is_paused = not self._paused_event.is_set()
+        if is_paused:
+            self._paused_event.set()
+            self.state.paused = True
             self.audio.stop_all()
-            self._pending_cleared = True
         else:
-            self.state.last_screenshot = None  # Force fresh capture on resume
-        status = "[yellow]PAUSED[/yellow]" if self.state.paused else "[green]RESUMED[/green]"
+            self._paused_event.clear()
+            self.state.paused = False
+            with self._state_lock:
+                self.state.last_screenshot = None
+        status = "[yellow]PAUSED[/yellow]" if is_paused else "[green]RESUMED[/green]"
         console.print(f"\n🎙️ Commentary {status} (Press {self.hotkey} to toggle)\n")
 
     def _poll_commands(self) -> None:
@@ -194,35 +215,33 @@ class Orchestrator:
         while True:
             try:
                 command = self._command_queue.get_nowait()
-            except Exception:
+            except queue.Empty:
                 break
 
             if command == Command.PAUSE:
+                self._paused_event.set()
                 self.state.paused = True
                 # Stop any currently playing audio immediately
                 self.audio.stop_all()
-                # Clear any prepared commentary so we start fresh on resume
-                self._clear_pending_commentary()
                 console.print("\n[yellow]🎙️ Commentary PAUSED (via UI)[/yellow]\n")
             elif command == Command.RESUME:
+                self._paused_event.clear()
                 self.state.paused = False
                 # Clear last screenshot so next capture triggers new commentary
-                self.state.last_screenshot = None
+                with self._state_lock:
+                    self.state.last_screenshot = None
                 console.print("\n[green]🎙️ Commentary RESUMED (via UI)[/green]\n")
             elif command == Command.STOP_COMMENTARY:
                 console.print("\n[yellow]🎙️ Stopping commentary (via UI)...[/yellow]\n")
                 self._running = False
                 self._shutdown_requested = True
+                self._shutdown_event.set()
             elif command == Command.STOP_WATCH:
                 console.print("\n[red]🎙️ Stop all requested (via UI)...[/red]\n")
                 self._running = False
                 self._shutdown_requested = True
+                self._shutdown_event.set()
                 self._stop_watch_requested = True
-    
-    def _clear_pending_commentary(self) -> None:
-        """Clear any pending/prepared commentary (used when pausing)."""
-        # This will be checked by the main loop
-        self._pending_cleared = True
 
     def _is_ui_focused(self) -> bool:
         """Check if the UI controller window is currently focused."""
@@ -230,11 +249,11 @@ class Orchestrator:
             return False
 
         # Get the latest value from the queue
-        try:
-            while not self._ui_focused_queue.empty():
+        while True:
+            try:
                 self._ui_focused = self._ui_focused_queue.get_nowait()
-        except Exception:
-            pass
+            except queue.Empty:
+                break
         return self._ui_focused
 
     @property
@@ -250,22 +269,63 @@ class Orchestrator:
         with console.status("[bold blue]Loading TTS model..."):
             self.tts.initialize()
 
+        # Align all audio generators to provider output sample rate.
+        # This avoids pitch/speed distortions when using Gemini (24kHz).
+        provider_rate = self.tts.sample_rate
+        self.audio = AudioManager(sample_rate=provider_rate)
+        self.crowd = CrowdManager(
+            sample_rate=provider_rate,
+            volume=self.settings.crowd_volume,
+            enabled=self.settings.crowd_enabled,
+            ambient_enabled=self.settings.crowd_ambient_enabled,
+            ambient_volume=self.settings.crowd_ambient_volume,
+        )
+        self.sfx = SFXManager(
+            sample_rate=provider_rate,
+            volume=self.settings.sfx_volume,
+            enabled=self.settings.sfx_enabled,
+        )
+
         console.print("[green]✓[/green] TTS model loaded")
         console.print("[green]✓[/green] Vision analyzer ready")
         console.print("[green]✓[/green] Commentary generator ready")
         console.print("[green]✓[/green] Audio player ready")
-        
+        console.print(
+            "[yellow]![/yellow] Screenshots are sent to the configured Gemini API for analysis"
+        )
+
+        # Show commentary mode
+        mode_display = {
+            "sports": "Sports (ESPN style)",
+            "wwe": "WWE Wrestling (JR + King)",
+            "freeman_mj": "Freeman + MJ (Calm + Chaos)",
+        }
+        mode_name = mode_display.get(self.settings.commentary_mode, self.settings.commentary_mode)
+        console.print(f"[green]✓[/green] Commentary mode: [bold cyan]{mode_name}[/bold cyan]")
+
         # Crowd sounds status
         if self.crowd.enabled:
-            console.print(f"[green]✓[/green] Crowd sounds enabled (volume: {self.settings.crowd_volume:.0%})")
+            console.print(
+                f"[green]✓[/green] Crowd sounds enabled (volume: {self.settings.crowd_volume:.0%})"
+            )
         else:
             console.print("[dim]○[/dim] Crowd sounds disabled")
-        
+
         # Ambient crowd sounds
         if self.crowd.ambient_enabled:
-            console.print(f"[green]✓[/green] Ambient crowd enabled (volume: {self.settings.crowd_ambient_volume:.0%})")
+            console.print(
+                f"[green]✓[/green] Ambient crowd enabled (volume: {self.settings.crowd_ambient_volume:.0%})"
+            )
         else:
             console.print("[dim]○[/dim] Ambient crowd disabled")
+
+        # Sound effects status
+        if self.sfx.enabled:
+            console.print(
+                f"[green]✓[/green] Sound effects enabled (volume: {self.settings.sfx_volume:.0%})"
+            )
+        else:
+            console.print("[dim]○[/dim] Sound effects disabled")
 
         # Set up hotkey listener
         if self.enable_hotkey:
@@ -290,75 +350,45 @@ class Orchestrator:
             f"[bold]Starting commentary ({mode}, every {self.settings.capture_interval}s)[/bold]"
         )
         if self._command_queue is not None:
-            console.print("[dim]UI controller active. Use the controller window to pause/stop.[/dim]\n")
+            console.print(
+                "[dim]UI controller active. Use the controller window to pause/stop.[/dim]\n"
+            )
         else:
             console.print(f"[dim]Press {self.hotkey} to pause/resume, Ctrl+C to stop[/dim]\n")
 
         self.audio.start()
-        
+
         # Start ambient crowd sounds if enabled
         if self.crowd.ambient_enabled:
             ambient_audio = self.crowd.generate_ambient_loop(duration=10.0)
             if ambient_audio is not None:
-                self.audio.set_ambient(ambient_audio, volume=1.0)  # Volume already applied in CrowdManager
+                self.audio.set_ambient(
+                    ambient_audio, volume=1.0
+                )  # Volume already applied in CrowdManager
                 self.audio.start_ambient()
                 console.print("[dim]Ambient crowd sounds started[/dim]")
 
         try:
             with self.capture:
-                import concurrent.futures
-                
-                # Use a thread pool to prepare next commentary while current plays
-                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                pending_future = None
-                
                 while self._running and not self._shutdown_requested:
                     # Poll for UI commands
                     self._poll_commands()
-                    
-                    # Check if pause cleared pending commentary
-                    if self._pending_cleared:
-                        if pending_future is not None:
-                            pending_future.cancel()
-                        pending_future = None
-                        self._pending_cleared = False
 
-                    if not self.state.paused:
-                        # Check if we have a prepared commentary ready
-                        if pending_future is not None and pending_future.done():
-                            try:
-                                next_audio, next_scene = pending_future.result()
-                                pending_future = None
-                                
-                                if next_audio is not None:
-                                    # Play the audio first (blocking)
-                                    if not self.state.paused:
-                                        self._speak_commentary_audio(next_audio, next_scene)
-                                    
-                                    # AFTER playback finishes, reset last_screenshot so next
-                                    # capture is treated as "changed" - screen likely changed
-                                    # during the 5-15 seconds of audio playback
-                                    self.state.last_screenshot = None
-                                    
-                                    # Now start preparing the next commentary
-                                    pending_future = executor.submit(self._prepare_commentary)
-                                else:
-                                    # No change detected and no audio playing - wait before retry
-                                    time.sleep(self.settings.capture_interval)
-                            except Exception as e:
-                                console.print(f"[red]Error getting prepared commentary: {e}[/red]")
-                                pending_future = None
-                        
-                        # If nothing is pending, start preparing immediately
-                        if pending_future is None:
-                            pending_future = executor.submit(self._prepare_commentary)
-                        
-                        # Small sleep to avoid busy loop while waiting for prep to complete
-                        time.sleep(0.1)
-                    else:
-                        time.sleep(0.5)  # Check less frequently when paused
-                
-                executor.shutdown(wait=False)
+                    if self._paused_event.is_set():
+                        time.sleep(0.2)
+                        continue
+
+                    if self._is_ui_focused():
+                        time.sleep(0.2)
+                        continue
+
+                    next_audio, next_scene = self._prepare_commentary()
+                    if next_audio is not None and not self._paused_event.is_set():
+                        self._speak_commentary_audio(next_audio, next_scene)
+                        with self._state_lock:
+                            self.state.last_screenshot = None
+
+                    time.sleep(self.settings.capture_interval)
 
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted by user[/yellow]")
@@ -374,17 +404,23 @@ class Orchestrator:
                 return None, None
 
             # 2. Check if screen has changed enough (skip if <5% difference)
-            if self.state.last_screenshot is not None:
-                diff_pct = screenshot.diff_percent(self.state.last_screenshot)
+            with self._state_lock:
+                last_screenshot = self.state.last_screenshot
+
+            if last_screenshot is not None:
+                diff_pct = screenshot.diff_percent(last_screenshot)
                 if diff_pct < 5.0:
                     self.state.commentaries_skipped += 1
                     console.print(f"[dim]Screen unchanged ({diff_pct:.1f}% diff), waiting...[/dim]")
                     return None, None
                 else:
-                    console.print(f"[dim]Screen changed ({diff_pct:.1f}% diff), generating commentary...[/dim]")
-            
+                    console.print(
+                        f"[dim]Screen changed ({diff_pct:.1f}% diff), generating commentary...[/dim]"
+                    )
+
             # Store for next comparison
-            self.state.last_screenshot = screenshot
+            with self._state_lock:
+                self.state.last_screenshot = screenshot
 
             # 3. Analyze scene
             scene = self._analyze_scene(screenshot)
@@ -416,15 +452,35 @@ class Orchestrator:
             self.state.errors += 1
             return None
 
-    def _speak_commentary_audio(self, audio: SynthesizedAudio, scene: Optional[SceneAnalysis] = None) -> None:
-        """Play pre-synthesized commentary audio with crowd sounds."""
+    def _speak_commentary_audio(
+        self, audio: SynthesizedAudio, scene: Optional[SceneAnalysis] = None
+    ) -> None:
+        """Play pre-synthesized commentary audio with SFX and crowd sounds."""
         try:
             self.state.audio_played += 1
 
-            # Get crowd sounds based on intensity
+            # Start with the TTS audio
             final_audio = audio.audio
+            sfx_info = ""
             crowd_info = ""
-            
+
+            # Check for detected event and get SFX
+            if scene and scene.detected_event and self.sfx.enabled:
+                sfx = self.sfx.get_sfx_for_event(
+                    scene.detected_event,
+                    mode=self.settings.commentary_mode,
+                )
+                if sfx:
+                    # Prepend SFX to audio (SFX plays BEFORE commentary)
+                    final_audio = self.sfx.create_sfx_then_commentary(
+                        sfx,
+                        final_audio,
+                        commentary_sample_rate=audio.sample_rate,
+                        gap_duration=0.2,  # Brief pause for impact
+                    )
+                    sfx_info = f" [bold yellow]+{sfx.sfx_type.value}[/bold yellow]"
+
+            # Add crowd sounds mixed underneath
             if scene and self.crowd.enabled:
                 crowd_audio = self.crowd.get_crowd_audio(
                     intensity=scene.intensity,
@@ -432,13 +488,16 @@ class Orchestrator:
                 )
                 if crowd_audio:
                     final_audio = self.crowd.mix_with_commentary(
-                        audio.audio, 
-                        crowd_audio,
+                        final_audio,
+                        commentary_sample_rate=audio.sample_rate,
+                        crowd_audio=crowd_audio,
                         crowd_position="under",
                     )
                     crowd_info = f" [dim]+crowd: {crowd_audio.reaction.value}[/dim]"
 
-            console.print(f"[dim]Playing audio ({audio.duration:.1f}s){crowd_info}...[/dim]")
+            console.print(
+                f"[dim]Playing audio ({audio.duration:.1f}s){sfx_info}{crowd_info}...[/dim]"
+            )
 
             # Play synchronously
             self.audio.play_commentary_sync(final_audio, audio.sample_rate)
@@ -468,7 +527,7 @@ class Orchestrator:
             # Build context from recent scenes
             context = None
             if self.state.recent_scenes:
-                context = "; ".join(s.action for s in self.state.recent_scenes[-2:])
+                context = "; ".join(s.action for s in list(self.state.recent_scenes)[-2:])
 
             scene = self.vision.analyze(screenshot, context)
             self.state.analyses_completed += 1
@@ -476,13 +535,14 @@ class Orchestrator:
 
             # Track recent scenes
             self.state.recent_scenes.append(scene)
-            if len(self.state.recent_scenes) > 5:
-                self.state.recent_scenes.pop(0)
 
             # Log the analysis
+            event_info = ""
+            if scene.detected_event:
+                event_info = f" [bold yellow]EVENT: {scene.detected_event}[/bold yellow]"
             console.print(
                 f"[dim]Scene:[/dim] {scene.action} "
-                f"[dim](mood: {scene.mood}, intensity: {scene.intensity})[/dim]"
+                f"[dim](mood: {scene.mood}, intensity: {scene.intensity})[/dim]{event_info}"
             )
 
             return scene
@@ -495,7 +555,7 @@ class Orchestrator:
     def _generate_commentary(self, scene: SceneAnalysis) -> Optional[Commentary]:
         """Generate commentary for a scene."""
         try:
-            commentary = self.commentary.generate(scene, self.state.recent_scenes)
+            commentary = self.commentary.generate(scene, list(self.state.recent_scenes))
             self.state.commentaries_generated += 1
             self.state.last_commentary = commentary
 
@@ -531,6 +591,7 @@ class Orchestrator:
         def handle_shutdown(signum, frame):
             self._shutdown_requested = True
             self._running = False
+            self._shutdown_event.set()
 
         signal.signal(signal.SIGINT, handle_shutdown)
         signal.signal(signal.SIGTERM, handle_shutdown)

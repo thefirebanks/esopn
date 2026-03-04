@@ -31,7 +31,7 @@ pip install -e .
 
 ```bash
 # Get a free API key from https://aistudio.google.com/apikey
-export GEMINI_API_KEY=your_key_here
+export ESOPN_GEMINI_API_KEY=your_key_here
 ```
 
 ### 2. Run with the UI controller (Recommended)
@@ -76,10 +76,9 @@ esopn watch [OPTIONS]
 
 Options:
   --ui                      Show floating UI controller window
-  -w, --active-window       Capture only the active/focused window (default: on)
-  -k, --gemini-key TEXT     Google Gemini API key
-  --hotkey TEXT             Hotkey to pause/resume (default: <ctrl>+<shift>+p)
-  --no-hotkey               Disable hotkey toggle
+  -i, --interval FLOAT      Seconds between screenshots
+  -d, --device TEXT         TTS device (cuda, mps, cpu, auto)
+  -M, --mode TEXT           Commentary mode (sports, wwe, freeman_mj)
   -v, --verbose             Enable verbose logging
 ```
 
@@ -140,15 +139,20 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GEMINI_API_KEY` | - | Google Gemini API key (required) |
+| `ESOPN_GEMINI_API_KEY` | - | Google Gemini API key (required) |
 | `ESOPN_CAPTURE_INTERVAL` | 3.0 | Seconds between screenshots |
 | `ESOPN_TTS_PROVIDER` | gemini | TTS provider (gemini or elevenlabs) |
 
 Or create a `.env` file:
 ```bash
-GEMINI_API_KEY=your_key_here
+ESOPN_GEMINI_API_KEY=your_key_here
 ESOPN_CAPTURE_INTERVAL=3.0
 ```
+
+## Security & Privacy
+
+- Screenshots are sent to Gemini for analysis. Avoid capturing windows with secrets, credentials, or private data.
+- Do not pass API keys on CLI flags; prefer `.env` or exported environment variables.
 
 ## License
 

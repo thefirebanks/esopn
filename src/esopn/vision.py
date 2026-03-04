@@ -24,13 +24,37 @@ IMPORTANT - IGNORE THESE (they are NOT real errors):
 - Type checker warnings (pyright, mypy, typescript errors in the problems panel)
 - These are just tooling noise, NOT actual code problems!
 
+DETECT NOTABLE EVENTS for sound effects - BE GENEROUS! Look for ANY of these:
+- "tests_pass" - ANY green checkmarks, "passed", "ok", "success" in test output, pytest showing green
+- "tests_fail" - ANY red X, "failed", "FAILED", "error" in test output
+- "error" - ANY exception, traceback, error message, red text in terminal, stack trace
+- "exception" - Same as error - Python exceptions, JS errors, any crash
+- "commit" - Git commit, "committed", staging files, git push, PR created
+- "build_success" - Build done, compiled, bundled, "Build succeeded"
+- "build_fail" - Build failed, compilation error, bundle error
+- "diff" - Code diff visible! Green/red lines (+/-), git diff, PR diff view, side-by-side comparison
+- "refactor" - Code being restructured, moved, renamed - visible refactoring
+- "big_moment" - Major refactor complete, feature finished, big code change, file creation
+- "start" - New file created, new project, fresh start
+
+BE AGGRESSIVE with event detection! If you see ANYTHING that looks like:
+- Terminal output with pass/fail → trigger tests_pass or tests_fail
+- Red text or error-looking output → trigger error
+- Git activity → trigger commit
+- Green/red diff lines (+/-), side-by-side code comparison → trigger diff
+- Code being restructured or moved around → trigger refactor
+- Lots of code being written at once → trigger big_moment
+
+When in doubt, TRIGGER AN EVENT. False positives are fun! Better to have sound effects than silence.
+
 Be SPECIFIC and CONCRETE. Extract actual names and code snippets.
 Output a JSON object with these fields:
 - action: SPECIFIC description like "Writing async function fetchUsers in api.ts" (not just "writing code")
 - details: SPECIFIC bullet points like "Adding useState hook for loading state", "Importing axios from node_modules"
 - mood: One of "triumph", "tension", "progress", "struggle", "neutral"
 - intensity: 1-10 scale of how exciting/noteworthy this moment is
-- notable_code: Actual code snippets, function names, or error messages visible (be specific!)"""
+- notable_code: Actual code snippets, function names, or error messages visible (be specific!)
+- detected_event: One of "tests_pass", "tests_fail", "error", "exception", "commit", "build_success", "build_fail", "diff", "refactor", "big_moment", "start", or null ONLY if truly nothing notable"""
 
 
 @dataclass
@@ -42,6 +66,7 @@ class SceneAnalysis:
     mood: str
     intensity: int
     notable_code: Optional[str] = None
+    detected_event: Optional[str] = None  # For triggering SFX
     raw_response: Optional[str] = None
 
 
@@ -78,7 +103,10 @@ class VisionAnalyzer:
         prompt += "\n\nAnalyze this screenshot and respond with JSON:"
 
         # Get base64 image
+        import base64
+
         image_data = screenshot.to_base64(max_size=(1280, 960))
+        image_bytes = base64.b64decode(image_data)
 
         # Create the content with image
         response = self.client.models.generate_content(
@@ -89,7 +117,7 @@ class VisionAnalyzer:
                         types.Part(
                             inline_data=types.Blob(
                                 mime_type="image/png",
-                                data=image_data,
+                                data=image_bytes,
                             )
                         ),
                         types.Part(text=prompt),
@@ -103,7 +131,15 @@ class VisionAnalyzer:
         )
 
         # Parse the response
-        return self._parse_response(response.text)
+        text = ""
+        try:
+            text = response.text or ""
+        except (ValueError, AttributeError):
+            if response.candidates and response.candidates[0].content.parts:
+                maybe_text = response.candidates[0].content.parts[0].text
+                text = maybe_text or ""
+
+        return self._parse_response(text)
 
     def _parse_response(self, text: str) -> SceneAnalysis:
         """Parse the model response into a SceneAnalysis object."""
@@ -116,10 +152,21 @@ class VisionAnalyzer:
         if json_match:
             json_str = json_match.group(1)
         else:
-            # Try to find raw JSON
-            json_match = re.search(r"\{.*\}", text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
+            # Try to find the first valid JSON object without greedy matching
+            decoder = json.JSONDecoder()
+            json_str = None
+            for i, ch in enumerate(text):
+                if ch != "{":
+                    continue
+                try:
+                    _, end_idx = decoder.raw_decode(text[i:])
+                    json_str = text[i : i + end_idx]
+                    break
+                except json.JSONDecodeError:
+                    continue
+
+            if json_str is not None:
+                pass
             else:
                 # Fallback: create from raw text
                 return SceneAnalysis(
@@ -132,12 +179,18 @@ class VisionAnalyzer:
 
         try:
             data = json.loads(json_str)
+            # Handle detected_event - can be null, None, or a string
+            detected_event = data.get("detected_event")
+            if detected_event in (None, "null", "None", ""):
+                detected_event = None
+
             return SceneAnalysis(
                 action=data.get("action", "Unknown action"),
                 details=data.get("details", []),
                 mood=data.get("mood", "neutral"),
                 intensity=min(10, max(1, int(data.get("intensity", 5)))),
                 notable_code=data.get("notable_code"),
+                detected_event=detected_event,
                 raw_response=text,
             )
         except (json.JSONDecodeError, ValueError):
@@ -157,5 +210,7 @@ async def analyze_screenshot_async(
     context: Optional[str] = None,
 ) -> SceneAnalysis:
     """Async convenience function for analyzing a screenshot."""
+    import asyncio
+
     analyzer = VisionAnalyzer(api_key=api_key, model=model)
-    return analyzer.analyze(screenshot, context)
+    return await asyncio.to_thread(analyzer.analyze, screenshot, context)

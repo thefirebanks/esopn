@@ -8,20 +8,22 @@ import numpy as np
 from google import genai
 from google.genai import types
 
+from .dialogue import ensure_speaker_tags
+
 logger = logging.getLogger(__name__)
 
 # Default voice configurations for the two commentators
 # See: https://ai.google.dev/gemini-api/docs/speech-generation
 DEFAULT_VOICES = {
-    "alex": "Orus",      # Male - bold, energetic lead play-by-play
+    "alex": "Orus",  # Male - bold, energetic lead play-by-play
     "morgan": "Fenrir",  # Male - deep, authoritative color commentary veteran
 }
 
-# Male voice options: Achird, Algenib, Algieba, Alnilam, Charon, Enceladus, 
+# Male voice options: Achird, Algenib, Algieba, Alnilam, Charon, Enceladus,
 #                     Fenrir, Iapetus, Orus, Puck, Rasalgethi, Sadachbia,
 #                     Sadaltager, Schedar, Umbriel, Zubenelgenubi
 # Female voice options: Kore, Aoede, Achernar, Autonoe, Callirrhoe, Despina,
-#                       Erinome, Gacrux, Laomedeia, Leda, Pulcherrima, 
+#                       Erinome, Gacrux, Laomedeia, Leda, Pulcherrima,
 #                       Sulafat, Vindemiatrix, Zephyr
 
 
@@ -37,7 +39,7 @@ class GeminiAudio:
 
 class GeminiTTS:
     """Gemini TTS client for dual-speaker commentary.
-    
+
     Uses Gemini's native multi-speaker TTS which supports [S1] and [S2] tags
     directly - perfect match for our dialogue format!
     """
@@ -78,15 +80,14 @@ class GeminiTTS:
             GeminiAudio with synthesized audio
         """
         # Ensure dialogue has proper speaker tags
-        if "[S1]" not in dialogue and "[S2]" not in dialogue:
-            dialogue = f"[S1] {dialogue}"
+        dialogue = ensure_speaker_tags(dialogue)
 
         logger.debug(f"Synthesizing with Gemini: {dialogue[:100]}...")
 
         # Retry logic for transient API errors
         max_retries = 3
         last_error = None
-        
+
         for attempt in range(max_retries):
             try:
                 response = self.client.models.generate_content(
@@ -149,14 +150,17 @@ class GeminiTTS:
                 if "500" in error_str or "503" in error_str or "INTERNAL" in error_str:
                     if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 1.0  # 1s, 2s, 3s
-                        logger.warning(f"Gemini TTS failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...")
+                        logger.warning(
+                            f"Gemini TTS failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
+                        )
                         import time
+
                         time.sleep(wait_time)
                         continue
                 # Non-retryable error, raise immediately
                 logger.error(f"Gemini TTS failed: {e}")
                 raise
-        
+
         # All retries exhausted
         logger.error(f"Gemini TTS failed after {max_retries} attempts: {last_error}")
         raise last_error
@@ -180,36 +184,54 @@ class GeminiTTS:
 
         logger.debug(f"Synthesizing single voice ({voice}): {text[:50]}...")
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=text,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voice
+        max_retries = 3
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=text,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
                             )
-                        )
+                        ),
                     ),
-                ),
-            )
+                )
 
-            # Extract audio data
-            part = response.candidates[0].content.parts[0]
-            audio_bytes = part.inline_data.data
-            audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                # Extract audio data
+                part = response.candidates[0].content.parts[0]
+                audio_bytes = part.inline_data.data
+                audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-            duration = len(audio) / self.sample_rate
+                duration = len(audio) / self.sample_rate
 
-            return GeminiAudio(
-                audio=audio,
-                sample_rate=self.sample_rate,
-                duration=duration,
-                text=text,
-            )
+                return GeminiAudio(
+                    audio=audio,
+                    sample_rate=self.sample_rate,
+                    duration=duration,
+                    text=text,
+                )
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                if "500" in error_str or "503" in error_str or "INTERNAL" in error_str:
+                    if attempt < max_retries - 1:
+                        wait_time = float(attempt + 1)
+                        logger.warning(
+                            "Gemini TTS (single) failed (attempt %s/%s), retrying in %.1fs",
+                            attempt + 1,
+                            max_retries,
+                            wait_time,
+                        )
+                        import time
 
-        except Exception as e:
-            logger.error(f"Gemini TTS (single) failed: {e}")
-            raise
+                        time.sleep(wait_time)
+                        continue
+                logger.error("Gemini TTS (single) failed: %s", e)
+                raise
+
+        raise RuntimeError(f"Gemini TTS (single) failed after retries: {last_error}")

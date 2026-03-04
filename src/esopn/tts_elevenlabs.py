@@ -8,6 +8,8 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 
+from .dialogue import ensure_speaker_tags, parse_dialogue_segments
+
 logger = logging.getLogger(__name__)
 
 # Default voice IDs for the two commentators
@@ -54,16 +56,16 @@ class ElevenLabsTTS:
         self.model_id = model_id
         self._client = None
 
-    def _get_client(self):
+    def _get_client(self) -> object:
         """Lazy-load ElevenLabs client."""
         if self._client is None:
             try:
                 from elevenlabs import ElevenLabs
+
                 self._client = ElevenLabs(api_key=self.api_key)
             except ImportError:
                 raise ImportError(
-                    "ElevenLabs package not installed. "
-                    "Install with: uv add elevenlabs"
+                    "ElevenLabs package not installed. Install with: uv add elevenlabs"
                 )
         return self._client
 
@@ -144,7 +146,7 @@ class ElevenLabsTTS:
             ElevenLabsAudio with combined audio
         """
         # Parse dialogue into segments
-        segments = self._parse_dialogue(dialogue)
+        segments = parse_dialogue_segments(ensure_speaker_tags(dialogue))
 
         if not segments:
             raise ValueError("No valid dialogue segments found")
@@ -160,9 +162,7 @@ class ElevenLabsTTS:
             sample_rate = result.sample_rate
 
         # Combine segments with crossfade
-        combined = self._combine_with_crossfade(
-            audio_segments, sample_rate, crossfade_ms
-        )
+        combined = self._combine_with_crossfade(audio_segments, sample_rate, crossfade_ms)
 
         return ElevenLabsAudio(
             audio=combined,
@@ -171,39 +171,6 @@ class ElevenLabsTTS:
             text=dialogue,
             voice_id="mixed",
         )
-
-    def _parse_dialogue(self, dialogue: str) -> list[tuple[str, str]]:
-        """
-        Parse dialogue text into (speaker, text) segments.
-
-        Args:
-            dialogue: Text with [S1] and [S2] tags
-
-        Returns:
-            List of (speaker, text) tuples
-        """
-        import re
-
-        segments = []
-        pattern = r"\[(S[12])\]\s*"
-
-        # Split by speaker tags, keeping the tags
-        parts = re.split(pattern, dialogue)
-
-        # parts will be like: ['', 'S1', ' text1 ', 'S2', ' text2 ']
-        i = 1  # Skip first empty part
-        while i < len(parts) - 1:
-            speaker = parts[i]
-            text = parts[i + 1].strip()
-            if text:
-                segments.append((speaker, text))
-            i += 2
-
-        # If no tags found, treat entire text as S1
-        if not segments and dialogue.strip():
-            segments.append(("S1", dialogue.strip()))
-
-        return segments
 
     def _combine_with_crossfade(
         self,
@@ -226,6 +193,11 @@ class ElevenLabsTTS:
             return segments[0]
 
         crossfade_samples = int(sample_rate * crossfade_ms / 1000)
+        max_crossfade = max(0, min(len(segment) for segment in segments) // 2)
+        crossfade_samples = min(crossfade_samples, max_crossfade)
+
+        if crossfade_samples == 0:
+            return np.concatenate(segments).astype(np.float32)
 
         # Calculate total length
         total_length = sum(len(s) for s in segments)
@@ -237,7 +209,7 @@ class ElevenLabsTTS:
         for i, segment in enumerate(segments):
             if i == 0:
                 # First segment: copy entirely
-                combined[:len(segment)] = segment
+                combined[: len(segment)] = segment
                 pos = len(segment) - crossfade_samples
             else:
                 # Subsequent segments: crossfade
@@ -245,12 +217,14 @@ class ElevenLabsTTS:
                 fade_out = np.linspace(1, 0, crossfade_samples, dtype=np.float32)
 
                 # Apply crossfade to overlap region
-                combined[pos:pos + crossfade_samples] *= fade_out
-                combined[pos:pos + crossfade_samples] += segment[:crossfade_samples] * fade_in
+                combined[pos : pos + crossfade_samples] *= fade_out
+                combined[pos : pos + crossfade_samples] += segment[:crossfade_samples] * fade_in
 
                 # Copy rest of segment
                 remaining = segment[crossfade_samples:]
-                combined[pos + crossfade_samples:pos + crossfade_samples + len(remaining)] = remaining
+                combined[pos + crossfade_samples : pos + crossfade_samples + len(remaining)] = (
+                    remaining
+                )
 
                 pos = pos + len(segment) - crossfade_samples
 

@@ -3,12 +3,24 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Protocol, Union, cast
 
 import numpy as np
 import torch
 
+from .dialogue import ensure_speaker_tags
+
 logger = logging.getLogger(__name__)
+
+
+ProviderName = Literal["gemini", "elevenlabs", "dia"]
+
+
+class TTSProvider(Protocol):
+    """Protocol for provider-specific TTS clients."""
+
+    def synthesize_dialogue(self, dialogue: str) -> Any:
+        """Synthesize dual-speaker dialogue."""
 
 
 @dataclass
@@ -73,16 +85,17 @@ class DiaTTS:
         logger.info(f"Device: {self.device}, dtype: {self.torch_dtype}")
 
         try:
-            from transformers import AutoProcessor, DiaForConditionalGeneration
-            from rich.console import Console
             import os
 
+            from rich.console import Console
+            from transformers import AutoProcessor, DiaForConditionalGeneration
+
             console = Console()
-            
+
             # Check if model is already cached
             cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
             model_cache = os.path.join(cache_dir, f"models--{self.model_id.replace('/', '--')}")
-            
+
             # Check for incomplete downloads
             blobs_dir = os.path.join(model_cache, "blobs")
             incomplete_files = []
@@ -97,32 +110,40 @@ class DiaTTS:
                         total_incomplete_size += size
                     else:
                         complete_size += size
-            
+
             total_downloaded = total_incomplete_size + complete_size
             is_first_download = not os.path.exists(model_cache) or incomplete_files
-            
+
             if is_first_download:
-                console.print(f"\n[bold cyan]📥 Downloading TTS model[/bold cyan] ({self.model_id})")
-                console.print("   [dim]Model size: ~3.2GB. First run will take a few minutes.[/dim]")
+                console.print(
+                    f"\n[bold cyan]📥 Downloading TTS model[/bold cyan] ({self.model_id})"
+                )
+                console.print(
+                    "   [dim]Model size: ~3.2GB. First run will take a few minutes.[/dim]"
+                )
                 if total_downloaded > 0:
                     downloaded_gb = total_downloaded / (1024**3)
-                    console.print(f"   [green]Resuming: {downloaded_gb:.1f}GB already downloaded[/green]")
+                    console.print(
+                        f"   [green]Resuming: {downloaded_gb:.1f}GB already downloaded[/green]"
+                    )
                     if incomplete_files:
-                        console.print(f"   [dim]({len(incomplete_files)} file(s) in progress)[/dim]")
+                        console.print(
+                            f"   [dim]({len(incomplete_files)} file(s) in progress)[/dim]"
+                        )
                 console.print()
             else:
-                console.print(f"\n[bold green]📦 Loading TTS model from cache...[/bold green]")
-            
+                console.print("\n[bold green]📦 Loading TTS model from cache...[/bold green]")
+
             # Load processor first (small, fast)
             self._processor = AutoProcessor.from_pretrained(self.model_id)
-            
+
             # Load model (this is where the big download happens)
             # transformers will show its own progress bars here
             self._model = DiaForConditionalGeneration.from_pretrained(
                 self.model_id,
                 torch_dtype=self.torch_dtype,
             ).to(self.device)
-            
+
             if is_first_download:
                 console.print("\n[bold green]✓ Model downloaded and loaded![/bold green]")
 
@@ -163,9 +184,7 @@ class DiaTTS:
             self.load()
 
         # Ensure dialogue has proper speaker tags
-        if "[S1]" not in dialogue and "[S2]" not in dialogue:
-            # Wrap in default speaker tag
-            dialogue = f"[S1] {dialogue}"
+        dialogue = ensure_speaker_tags(dialogue)
 
         logger.debug(f"Synthesizing: {dialogue[:100]}...")
 
@@ -266,7 +285,7 @@ class TTSManager:
 
     def __init__(
         self,
-        provider: Literal["gemini", "elevenlabs", "dia"] = "gemini",
+        provider: ProviderName = "gemini",
         # Gemini settings (default - FREE!)
         gemini_api_key: Optional[str] = None,
         gemini_alex_voice: str = "Fenrir",
@@ -297,7 +316,7 @@ class TTSManager:
         """
         self.provider = provider
         self._initialized = False
-        self._tts = None
+        self._tts: Optional[object] = None
         self._sample_rate = 44100  # Default, updated based on provider
 
         # Store settings for lazy initialization
@@ -327,12 +346,12 @@ class TTSManager:
         if self._initialized:
             return
 
-        if self.provider == "gemini":
-            self._init_gemini()
-        elif self.provider == "elevenlabs":
-            self._init_elevenlabs()
-        else:
-            self._init_dia()
+        init_handlers = {
+            "gemini": self._init_gemini,
+            "elevenlabs": self._init_elevenlabs,
+            "dia": self._init_dia,
+        }
+        init_handlers[self.provider]()
 
         self._initialized = True
 
@@ -379,7 +398,7 @@ class TTSManager:
         device_literal: Optional[Literal["cuda", "mps", "cpu"]] = None
         device = self._dia_settings["device"]
         if device in ("cuda", "mps", "cpu"):
-            device_literal = device  # type: ignore
+            device_literal = cast(Literal["cuda", "mps", "cpu"], device)
 
         self._tts = DiaTTS(
             model_id=self._dia_settings["model_id"],
@@ -405,8 +424,9 @@ class TTSManager:
         if self.provider == "gemini":
             # Use Gemini (FREE!)
             from esopn.tts_gemini import GeminiTTS
-            assert isinstance(self._tts, GeminiTTS)
-            result = self._tts.synthesize_dialogue(dialogue)
+
+            tts = cast(GeminiTTS, self._tts)
+            result = tts.synthesize_dialogue(dialogue)
             return SynthesizedAudio(
                 audio=result.audio,
                 sample_rate=result.sample_rate,
@@ -416,8 +436,9 @@ class TTSManager:
         elif self.provider == "elevenlabs":
             # Use ElevenLabs
             from esopn.tts_elevenlabs import ElevenLabsTTS
-            assert isinstance(self._tts, ElevenLabsTTS)
-            result = self._tts.synthesize_dialogue(dialogue)
+
+            tts = cast(ElevenLabsTTS, self._tts)
+            result = tts.synthesize_dialogue(dialogue)
             return SynthesizedAudio(
                 audio=result.audio,
                 sample_rate=result.sample_rate,
@@ -426,13 +447,14 @@ class TTSManager:
             )
         else:
             # Use Dia
-            assert isinstance(self._tts, DiaTTS)
-            return self._tts.synthesize(dialogue, **kwargs)
+            tts = cast(DiaTTS, self._tts)
+            return tts.synthesize(dialogue, **kwargs)
 
     def get_usage(self) -> dict:
         """Get API usage stats (ElevenLabs only)."""
         if self.provider == "elevenlabs" and self._tts is not None:
             from esopn.tts_elevenlabs import ElevenLabsTTS
+
             if isinstance(self._tts, ElevenLabsTTS):
                 return self._tts.get_character_usage()
         return {}

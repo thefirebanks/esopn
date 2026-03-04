@@ -2,6 +2,7 @@
 
 from enum import Enum, auto
 from multiprocessing import Queue
+from queue import Empty
 from typing import Optional
 
 
@@ -61,7 +62,7 @@ class CommandBus:
                 return self._command_queue.get_nowait()
             else:
                 return self._command_queue.get(timeout=timeout)
-        except Exception:
+        except Empty:
             return None
 
     def set_ui_focused(self, focused: bool) -> None:
@@ -71,12 +72,11 @@ class CommandBus:
         Args:
             focused: Whether the UI window is currently focused
         """
-        # Clear any old values and put the new state
-        try:
-            while not self._ui_focused_queue.empty():
+        while True:
+            try:
                 self._ui_focused_queue.get_nowait()
-        except Exception:
-            pass
+            except Empty:
+                break
         self._ui_focused_queue.put(focused)
 
     def is_ui_focused(self) -> bool:
@@ -86,12 +86,11 @@ class CommandBus:
         Returns:
             True if UI is focused, False otherwise
         """
-        # Get the latest value from the queue
-        try:
-            while not self._ui_focused_queue.empty():
+        while True:
+            try:
                 self._ui_focused = self._ui_focused_queue.get_nowait()
-        except Exception:
-            pass
+            except Empty:
+                break
         return self._ui_focused
 
     def drain(self) -> list[Command]:

@@ -2,6 +2,7 @@
 
 import tkinter as tk
 from multiprocessing import Queue
+from queue import Empty
 from typing import Optional
 
 from .control import Command
@@ -19,7 +20,12 @@ class ControllerWindow:
     WINDOW_HEIGHT = 150
     TITLE = "ESOPN Controller"
 
-    def __init__(self, command_queue: Queue, ui_focused_queue: Queue):
+    def __init__(
+        self,
+        command_queue: Queue,
+        ui_focused_queue: Queue,
+        watch_control_queue: Optional[Queue] = None,
+    ):
         """
         Initialize the controller window.
 
@@ -29,6 +35,7 @@ class ControllerWindow:
         """
         self._command_queue = command_queue
         self._ui_focused_queue = ui_focused_queue
+        self._watch_control_queue = watch_control_queue
         self._root: Optional[tk.Tk] = None
         self._status_var: Optional[tk.StringVar] = None
         self._paused = False
@@ -36,6 +43,8 @@ class ControllerWindow:
     def _send_command(self, command: Command) -> None:
         """Send a command to the orchestrator."""
         self._command_queue.put(command)
+        if command == Command.STOP_WATCH and self._watch_control_queue is not None:
+            self._watch_control_queue.put(command)
 
         # Update status based on command
         if command == Command.PAUSE:
@@ -54,22 +63,21 @@ class ControllerWindow:
         if self._status_var:
             self._status_var.set(f"Status: {status}")
 
-    def _on_focus_in(self, event) -> None:
+    def _on_focus_in(self, event: tk.Event) -> None:
         """Handle window gaining focus."""
         self._report_focus(True)
 
-    def _on_focus_out(self, event) -> None:
+    def _on_focus_out(self, event: tk.Event) -> None:
         """Handle window losing focus."""
         self._report_focus(False)
 
     def _report_focus(self, focused: bool) -> None:
         """Report focus state to the orchestrator."""
-        # Clear old values and put new state
-        try:
-            while not self._ui_focused_queue.empty():
+        while True:
+            try:
                 self._ui_focused_queue.get_nowait()
-        except Exception:
-            pass
+            except Empty:
+                break
         self._ui_focused_queue.put(focused)
 
     def _on_pause(self) -> None:
@@ -191,7 +199,11 @@ class ControllerWindow:
         self._root.mainloop()
 
 
-def run_controller_window(command_queue: Queue, ui_focused_queue: Queue) -> None:
+def run_controller_window(
+    command_queue: Queue,
+    ui_focused_queue: Queue,
+    watch_control_queue: Optional[Queue] = None,
+) -> None:
     """
     Entry point for running the controller window in a separate process.
 
@@ -199,5 +211,5 @@ def run_controller_window(command_queue: Queue, ui_focused_queue: Queue) -> None
         command_queue: Queue to send commands to orchestrator
         ui_focused_queue: Queue to report focus state
     """
-    window = ControllerWindow(command_queue, ui_focused_queue)
+    window = ControllerWindow(command_queue, ui_focused_queue, watch_control_queue)
     window.run()
